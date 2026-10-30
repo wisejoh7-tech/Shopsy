@@ -6,7 +6,8 @@ import {
   updateProfile,
   signOut,
   GoogleAuthProvider,
-  signInWithPopup
+  signInWithPopup,
+  signInWithCustomToken
 } from 'firebase/auth';
 import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
 import { Button } from '@/components/ui/button';
@@ -101,25 +102,73 @@ export default function AuthModal({ isOpen, onClose }: AuthModalProps) {
     setIsLoading(true);
     try {
       const provider = new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
-      const user = result.user;
+      provider.addScope('email');
+      provider.addScope('profile');
 
-      // Check if user profile exists, if not create it
-      const docRef = doc(db, 'users', user.uid);
-      const isAdminEmail = user.email?.toLowerCase().trim() === 'idemudiawisdom27@gmail.com' ||
-                         user.email === import.meta.env.VITE_ADMIN_EMAIL;
+      let user: any = null;
+      let idToken: string | null = null;
 
-      await setDoc(docRef, {
-        uid: user.uid,
-        email: user.email,
-        displayName: user.displayName,
-        photoURL: user.photoURL,
-        role: isAdminEmail ? 'admin' : 'user',
-        lastLogin: serverTimestamp(),
-      }, { merge: true });
+      try {
+        const result = await signInWithPopup(auth, provider);
+        user = result.user;
+        idToken = await user.getIdToken().catch(() => null);
+      } catch (popupErr: any) {
+        console.warn("Google popup sign-in warning/error:", popupErr);
+        throw popupErr;
+      }
 
-      toast.success("Signed in with Google!");
-      onClose();
+      if (user) {
+        // Synchronize with backend API for activity logs, custom claims & Firestore backup
+        try {
+          const syncRes = await fetch(`${API_URL}/api/auth/google`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              idToken,
+              email: user.email,
+              name: user.displayName,
+              photoURL: user.photoURL
+            })
+          });
+          const syncData = await syncRes.json();
+          if (syncData.success && syncData.customToken) {
+            await signInWithCustomToken(auth, syncData.customToken).catch(() => {});
+          }
+        } catch (apiErr) {
+          console.warn("Backend Google sync endpoint notification skipped:", apiErr);
+        }
+
+        // Set local user profile in Firestore
+        const docRef = doc(db, 'users', user.uid);
+        const isAdminEmail = user.email?.toLowerCase().trim() === 'idemudiawisdom27@gmail.com' ||
+                           user.email?.toLowerCase().trim() === (import.meta.env.VITE_ADMIN_EMAIL || '').toLowerCase().trim();
+
+        if (isAdminEmail) {
+          localStorage.setItem('isAdmin', 'true');
+        }
+
+        await setDoc(docRef, {
+          uid: user.uid,
+          email: user.email,
+          displayName: user.displayName || user.email?.split('@')[0],
+          photoURL: user.photoURL || '',
+          role: isAdminEmail ? 'admin' : 'user',
+          lastLogin: serverTimestamp(),
+        }, { merge: true });
+
+        // Send welcome email asynchronously for new users
+        fetch(`${API_URL}/api/send-welcome`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: user.email,
+            name: user.displayName || user.email?.split('@')[0] || 'Customer'
+          }),
+        }).catch(() => {});
+
+        toast.success(`Signed in with Google as ${user.displayName || user.email}!`);
+        onClose();
+      }
     } catch (error: any) {
       toast.error(getFirebaseErrorMessage(error));
     } finally {

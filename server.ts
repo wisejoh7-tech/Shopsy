@@ -863,6 +863,109 @@ app.post("/api/auth/fingerprint/login", async (req, res, next) => {
   }
 });
 
+app.post("/api/auth/google", async (req, res, next) => {
+  try {
+    const { idToken, credential, code, email: bodyEmail, name: bodyName, photoURL: bodyPhoto } = req.body || {};
+    const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    const googleClientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID;
+
+    let googleUser: { email?: string; name?: string; picture?: string; sub?: string } = {};
+
+    const tokenToVerify = idToken || credential;
+
+    if (tokenToVerify) {
+      try {
+        const gResponse = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(tokenToVerify)}`);
+        if (gResponse.ok) {
+          googleUser = await gResponse.json();
+        } else if (isFirebaseAdminInitialized) {
+          try {
+            const decodedToken = await admin.auth().verifyIdToken(tokenToVerify);
+            googleUser = {
+              email: decodedToken.email,
+              name: decodedToken.name,
+              picture: decodedToken.picture,
+              sub: decodedToken.uid
+            };
+          } catch (e) {
+            console.warn("Firebase verifyIdToken error:", e);
+          }
+        }
+      } catch (err: any) {
+        console.warn("Google token verification fetch error:", err.message);
+      }
+    }
+
+    const email = (googleUser.email || bodyEmail || "").toLowerCase().trim();
+    const name = googleUser.name || bodyName || email.split("@")[0] || "Google User";
+    const picture = googleUser.picture || bodyPhoto || "";
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Google authentication failed: Email address is required."
+      });
+    }
+
+    const primaryAdminEmail = (process.env.ADMIN_EMAIL || 'idemudiawisdom27@gmail.com').toLowerCase().trim();
+    const role = email === primaryAdminEmail ? 'admin' : 'user';
+
+    let uid = googleUser.sub || `google_${Buffer.from(email).toString('hex').slice(0, 20)}`;
+    let customToken = null;
+
+    if (isFirebaseAdminInitialized) {
+      try {
+        let userRecord;
+        try {
+          userRecord = await admin.auth().getUserByEmail(email);
+          uid = userRecord.uid;
+        } catch (uErr) {
+          userRecord = await admin.auth().createUser({
+            email,
+            displayName: name,
+            photoURL: picture,
+            emailVerified: true
+          });
+          uid = userRecord.uid;
+        }
+
+        const userDocRef = admin.firestore().collection('users').doc(uid);
+        await userDocRef.set({
+          uid,
+          email,
+          displayName: name,
+          photoURL: picture,
+          role,
+          provider: 'google.com',
+          lastLogin: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        customToken = await admin.auth().createCustomToken(uid);
+      } catch (fErr: any) {
+        console.warn("Firestore/Auth error during Google sign in:", fErr.message);
+      }
+    }
+
+    io.emit("new_activity", {
+      message: `User signed in with Google: ${email}`,
+      type: "auth"
+    });
+
+    res.json({
+      success: true,
+      customToken,
+      uid,
+      email,
+      displayName: name,
+      photoURL: picture,
+      role,
+      googleConfigured: Boolean(googleClientSecret && googleClientId)
+    });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
 app.post("/api/auth/fingerprint/remove", async (req, res, next) => {
   try {
     const { userId, email } = req.body || {};
